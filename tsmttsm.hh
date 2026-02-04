@@ -387,10 +387,12 @@ sycl::event tsmttsm8(sycl::queue& q, int K, T* A, T* B, T* C)
     sycl::local_accessor<T, 1> local_c(TM * TN, cgh);
 
     cgh.parallel_for(sycl::nd_range<1>(total_workers, wg_size), [=](sycl::nd_item<1> item) {
-      auto global_id = item.get_global_linear_id();
+      auto group_id = item.get_group(0);
       auto local_id = item.get_local_linear_id();
-      auto tile_idx = global_id % num_tiles;
-      auto worker_id = global_id / num_tiles;
+      
+      // Each workgroup processes exactly one tile
+      auto tile_idx = group_id % num_tiles;
+      auto worker_id = (group_id / num_tiles) * wg_size + local_id;
 
       // Transposed tile mapping for coalesced access
       auto tile_m = tile_idx / num_tiles_n;

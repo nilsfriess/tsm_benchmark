@@ -63,7 +63,7 @@ int main() {
 
   const auto flops = 2.0 * K * M * M;
 
-  using Scalar = float;
+  using Scalar = double;
 
   auto* A = sycl::malloc_shared<Scalar>(K * M, q);
   auto* B = sycl::malloc_shared<Scalar>(K * M, q);
