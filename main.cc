@@ -159,7 +159,7 @@ int main() {
   std::cout << "Device: " << q.get_device().get_info<sycl::info::device::vendor>() << " "
             << q.get_device().get_info<sycl::info::device::name>() << "\n";
 
-  using Scalar = float;
+  using Scalar = double;
   constexpr int K = 1024 * 1024;
   constexpr int warmup = 50;
   constexpr int runs = 100;
