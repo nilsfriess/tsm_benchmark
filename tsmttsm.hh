@@ -296,3 +296,68 @@ sycl::event tsmttsm6(sycl::queue &q, int K, T* A, T* B, T* C) {
     });
   });
 }
+
+/* Variant 7: Combines variant 4's transposed tiling with correct double buffering using ping-pong pattern.
+   The double buffering allows the compiler to overlap memory loads with computation.
+*/
+template <typename T, int M, int stride, int max_tile_size>
+sycl::event tsmttsm7(sycl::queue& q, int K, T* A, T* B, T* C)
+{
+  constexpr auto tile_size = std::min(max_tile_size, M);
+  static_assert((M * M) % (tile_size * tile_size) == 0, "Currently it is assumed that the tiles fit perfectly");
+  constexpr auto num_tiles = (M * M) / (tile_size * tile_size);
+  constexpr auto tiles_per_dim = M / tile_size;
+
+  return q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(stride, [=](auto item) {
+      T c_local[tile_size][tile_size] = {0};
+
+      int tid = item[0];
+      auto k_start = tid / num_tiles;
+      auto k_stride = stride / num_tiles;
+
+      auto tile_idx = tid % num_tiles;
+      auto tile_row_start = (tile_idx % tiles_per_dim);
+      auto tile_col_start = (tile_idx / tiles_per_dim);
+
+      // Double buffering: two sets of buffers for ping-pong
+      T A_vals[2][tile_size];
+      T B_vals[2][tile_size];
+
+      if (k_start < K) {
+        // Preload first iteration into buffer 0
+        for (int i = 0; i < tile_size; ++i) {
+          A_vals[0][i] = A[k_start * M + (tile_row_start + i * tiles_per_dim)];
+          B_vals[0][i] = B[k_start * M + (tile_col_start + i * tiles_per_dim)];
+        }
+      }
+
+      int current_buf = 0;
+      for (int k = k_start; k < K; k += k_stride) {
+        int next_buf = 1 - current_buf;
+        
+        // Prefetch next iteration into the other buffer
+        if (k + k_stride < K) {
+          for (int i = 0; i < tile_size; ++i) {
+            A_vals[next_buf][i] = A[(k + k_stride) * M + (tile_row_start + i * tiles_per_dim)];
+            B_vals[next_buf][i] = B[(k + k_stride) * M + (tile_col_start + i * tiles_per_dim)];
+          }
+        }
+
+        // Compute using current buffer - compiler can overlap this with above loads
+        for (int m = 0; m < tile_size; ++m)
+          for (int n = 0; n < tile_size; ++n) 
+            c_local[m][n] += A_vals[current_buf][m] * B_vals[current_buf][n];
+
+        current_buf = next_buf;
+      }
+
+      for (int m = 0; m < tile_size; ++m)
+        for (int n = 0; n < tile_size; ++n) {
+          auto gidx = (tile_row_start + m * tiles_per_dim) * M + (tile_col_start + n * tiles_per_dim);
+          sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> C_ref(C[gidx]);
+          C_ref += c_local[m][n];
+        }
+    });
+  });
+}
