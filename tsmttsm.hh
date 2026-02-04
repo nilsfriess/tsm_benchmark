@@ -362,6 +362,82 @@ sycl::event tsmttsm7(sycl::queue& q, int K, T* A, T* B, T* C)
   });
 }
 
+/* Variant 9: Combines variant 4's transposed tiling with variant 6's two-stage atomic reduction.
+   No double buffering, just simple loads with good memory access patterns.
+*/
+template <typename T, int M, int global_size, int local_size, int max_tile_size>
+sycl::event tsmttsm9(sycl::queue &q, int K, T* A, T* B, T* C) {
+  constexpr auto tile_size = std::min(max_tile_size, M);
+  static_assert((M*M) % (tile_size * tile_size) == 0);
+  constexpr auto num_tiles = (M*M) / (tile_size * tile_size);
+  constexpr auto tiles_per_dim = M / tile_size;
+  constexpr auto num_groups = global_size / local_size;
+  
+  return q.submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<T, 2> C_shared({tile_size, tile_size}, cgh);
+    
+    cgh.parallel_for(sycl::nd_range<1>{global_size, local_size}, [=](auto item) {
+      T c_local[tile_size][tile_size] = {0};
+
+      int lid = item.get_local_id(0);
+      int group_id = item.get_group(0);
+
+      // All threads in work-group work on the SAME tile
+      auto tile_idx = group_id % num_tiles;
+      // Use variant 4's transposed tile indexing
+      auto tile_row_start = (tile_idx % tiles_per_dim);
+      auto tile_col_start = (tile_idx / tiles_per_dim);
+
+      // Divide k iterations among threads in the work-group
+      auto k_start = (group_id / num_tiles) * local_size + lid;
+      auto k_stride = (num_groups / num_tiles) * local_size;
+
+      if (lid == 0) {
+        for (int m = 0; m < tile_size; ++m)
+          for (int n = 0; n < tile_size; ++n)
+            C_shared[m][n] = 0;
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+
+      T A_vals[tile_size];
+      T B_vals[tile_size];
+
+      for (int k = k_start; k < K; k += k_stride) {
+        // Use variant 4's strided access pattern
+        for (int i = 0; i < tile_size; ++i) {
+          A_vals[i] = A[k * M + (tile_row_start + i * tiles_per_dim)];
+          B_vals[i] = B[k * M + (tile_col_start + i * tiles_per_dim)];
+        }
+
+        for (int m = 0; m < tile_size; ++m)
+          for (int n = 0; n < tile_size; ++n)
+            c_local[m][n] += A_vals[m] * B_vals[n];
+      }
+
+      // Local reduction
+      item.barrier(sycl::access::fence_space::local_space);
+      for (int m = 0; m < tile_size; ++m)
+        for (int n = 0; n < tile_size; ++n) {
+          sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space> C_ref(C_shared[m][n]);
+          C_ref += c_local[m][n];
+        }
+
+      // Barrier before reading C_shared
+      item.barrier(sycl::access::fence_space::local_space);
+
+      if (lid == 0) {
+        for (int m = 0; m < tile_size; ++m)
+          for (int n = 0; n < tile_size; ++n) {
+            // Use variant 4's strided global indexing
+            auto gidx = (tile_row_start + m * tiles_per_dim) * M + (tile_col_start + n * tiles_per_dim);
+            sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> C_ref(C[gidx]);
+            C_ref += C_shared[m][n];
+          }
+      }
+    });
+  });
+}
+
 /* Variant 8: Adaptive tile size with two-level reduction and double buffering.
    Based on an external implementation that dynamically determines worker count
    and uses workgroup-local reduction before global atomics.
