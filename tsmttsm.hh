@@ -361,3 +361,148 @@ sycl::event tsmttsm7(sycl::queue& q, int K, T* A, T* B, T* C)
     });
   });
 }
+
+/* Variant 8: Adaptive tile size with two-level reduction and double buffering.
+   Based on an external implementation that dynamically determines worker count
+   and uses workgroup-local reduction before global atomics.
+*/
+template <typename T, int M, int worker_mult = 64>
+sycl::event tsmttsm8(sycl::queue& q, int K, T* A, T* B, T* C)
+{
+  // Adaptive tile size based on matrix dimensions
+  constexpr int TM = (M * M <= 16) ? M : ((M * M <= 64) ? 2 : 4);
+  constexpr int TN = (M * M <= 16) ? M : ((M * M <= 64) ? 2 : 4);
+  constexpr int num_tiles_m = (M + TM - 1) / TM;
+  constexpr int num_tiles_n = (M + TN - 1) / TN;
+  constexpr int num_tiles = num_tiles_m * num_tiles_n;
+
+  return q.submit([&](sycl::handler& cgh) {
+    const auto num_cu = q.get_device().get_info<sycl::info::device::max_compute_units>();
+    constexpr int wg_size = 256;
+    const auto num_wg_per_tile = std::max<int>(1, worker_mult * num_cu / wg_size);
+    const auto workers_per_tile = num_wg_per_tile * wg_size;
+    const auto total_workers = num_tiles * workers_per_tile;
+
+    // Local memory for workgroup-level reduction
+    sycl::local_accessor<T, 1> local_c(TM * TN, cgh);
+
+    cgh.parallel_for(sycl::nd_range<1>(total_workers, wg_size), [=](sycl::nd_item<1> item) {
+      auto global_id = item.get_global_linear_id();
+      auto local_id = item.get_local_linear_id();
+      auto tile_idx = global_id % num_tiles;
+      auto worker_id = global_id / num_tiles;
+
+      // Transposed tile mapping for coalesced access
+      auto tile_m = tile_idx / num_tiles_n;
+      auto tile_n = tile_idx % num_tiles_n;
+
+      int m_indices[TM];
+      int n_indices[TN];
+      if constexpr (TM < M) {
+        // Transposed: interleaved pattern
+        for (int tm = 0; tm < TM; ++tm) {
+          m_indices[tm] = tile_m + tm * num_tiles_m;
+        }
+        for (int tn = 0; tn < TN; ++tn) {
+          n_indices[tn] = tile_n + tn * num_tiles_n;
+        }
+      } else {
+        // Small blocksize: contiguous
+        for (int tm = 0; tm < TM; ++tm) {
+          m_indices[tm] = tm;
+        }
+        for (int tn = 0; tn < TN; ++tn) {
+          n_indices[tn] = tn;
+        }
+      }
+
+      T c_local[TM][TN] = {};
+
+      // Use different strategies based on tile size
+      if constexpr (TM >= 4) {
+        // Leap-frogging (double buffering) for larger tiles
+        T a_curr[TM], a_next[TM];
+        T b_curr[TN], b_next[TN];
+
+        // Prefetch first iteration
+        int k = worker_id;
+        if (k < K) {
+          for (int tm = 0; tm < TM; ++tm) {
+            a_next[tm] = A[k * M + m_indices[tm]];
+          }
+          for (int tn = 0; tn < TN; ++tn) {
+            b_next[tn] = B[k * M + n_indices[tn]];
+          }
+        }
+
+        // Main loop with prefetching
+        for (; k < K; k += workers_per_tile) {
+          // Current = what we prefetched
+          for (int tm = 0; tm < TM; ++tm) a_curr[tm] = a_next[tm];
+          for (int tn = 0; tn < TN; ++tn) b_curr[tn] = b_next[tn];
+
+          // Prefetch next iteration
+          int k_next = k + workers_per_tile;
+          if (k_next < K) {
+            for (int tm = 0; tm < TM; ++tm) {
+              a_next[tm] = A[k_next * M + m_indices[tm]];
+            }
+            for (int tn = 0; tn < TN; ++tn) {
+              b_next[tn] = B[k_next * M + n_indices[tn]];
+            }
+          }
+
+          // Compute outer product
+          for (int tn = 0; tn < TN; ++tn) {
+            for (int tm = 0; tm < TM; ++tm) {
+              c_local[tm][tn] += a_curr[tm] * b_curr[tn];
+            }
+          }
+        }
+      } else {
+        // Simple path for small tiles
+        for (int k = worker_id; k < K; k += workers_per_tile) {
+          T a_reg[TM];
+          for (int tm = 0; tm < TM; ++tm) {
+            a_reg[tm] = A[k * M + m_indices[tm]];
+          }
+
+          for (int tn = 0; tn < TN; ++tn) {
+            T b_val = B[k * M + n_indices[tn]];
+            for (int tm = 0; tm < TM; ++tm) {
+              c_local[tm][tn] += a_reg[tm] * b_val;
+            }
+          }
+        }
+      }
+
+      // Two-level reduction
+      // 1. Initialize local memory
+      if (local_id < TM * TN) {
+        local_c[local_id] = T(0);
+      }
+      sycl::group_barrier(item.get_group());
+
+      // 2. All threads atomically add to local memory
+      for (int tm = 0; tm < TM; ++tm) {
+        for (int tn = 0; tn < TN; ++tn) {
+          sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space> local_ref(
+              local_c[tm * TN + tn]);
+          local_ref += c_local[tm][tn];
+        }
+      }
+      sycl::group_barrier(item.get_group());
+
+      // 3. Only first thread does global atomic
+      if (local_id == 0) {
+        for (int tm = 0; tm < TM; ++tm) {
+          for (int tn = 0; tn < TN; ++tn) {
+            sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> c_ref(
+                C[m_indices[tm] * M + n_indices[tn]]);
+            c_ref += local_c[tm * TN + tn];
+          }
+        }
+      }
+    });
+  });
+}

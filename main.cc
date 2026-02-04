@@ -108,6 +108,7 @@ int main() {
   check_correctness("Variant 5", [&]() { return tsmttsm5<Scalar, M, stride, max_tile_size>(q, K, A, B, C); });
   check_correctness("Variant 6", [&]() { return tsmttsm6<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); });
   check_correctness("Variant 7", [&]() { return tsmttsm7<Scalar, M, stride, max_tile_size>(q, K, A, B, C); });
+  check_correctness("Variant 8", [&]() { return tsmttsm8<Scalar, M>(q, K, A, B, C); });
 
   std::cout << "\n=== Performance (warmup=" << warmup << ", runs=" << runs << ") ===\n";
 
@@ -158,6 +159,7 @@ int main() {
   print_stats("Variant 5", run_and_profile([&]() { return tsmttsm5<Scalar, M, stride, max_tile_size>(q, K, A, B, C); }));
   print_stats("Variant 6", run_and_profile([&]() { return tsmttsm6<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); }));
   print_stats("Variant 7", run_and_profile([&]() { return tsmttsm7<Scalar, M, stride, max_tile_size>(q, K, A, B, C); }));
+  print_stats("Variant 8", run_and_profile([&]() { return tsmttsm8<Scalar, M>(q, K, A, B, C); }));
 
   sycl::free(A, q);
   sycl::free(B, q);
