@@ -27,8 +27,8 @@ std::vector<T> compute_naive(int K, int M, T* A, T* B) {
 }
 
 template <class T>
-bool is_correct(const std::vector<T>& C_correct, T* C, T rel_tol = 1e-6, T abs_tol = 1e-10) {
-  for (std::size_t i = 0; i < C_correct.size(); ++i) {
+bool is_correct(const std::vector<T>& C_correct, T* C, int M, T rel_tol = 1e-6, T abs_tol = 1e-10) {
+  for (int i = 0; i < M * M; ++i) {
     T diff = std::abs(C_correct[i] - C[i]);
     T magnitude = std::max(std::abs(C_correct[i]), std::abs(C[i]));
     if (diff > abs_tol && diff > rel_tol * magnitude) {
@@ -48,22 +48,17 @@ struct BenchmarkStats {
   double gflops;
 };
 
-int main() {
-  sycl::queue q{{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}}};
-  std::cout << "Device: " << q.get_device().get_info<sycl::info::device::vendor>() << " "
-            << q.get_device().get_info<sycl::info::device::name>() << "\n\n";
-
-  constexpr int K = 1024 * 1024;
-  constexpr int M = 16;
-  constexpr int stride = 32768 / 2; // aka global_size in nd_range kernels
-  constexpr int local_size = 32;  
-  constexpr int max_tile_size = 4;
-  constexpr int warmup = 100;
-  constexpr int runs = 200;
-
-  const auto flops = 2.0 * K * M * M;
-
-  using Scalar = double;
+template <typename Scalar, int M, int K, int stride, int local_size, int max_tile_size, int warmup, int runs>
+void run_benchmark_suite(sycl::queue& q) {
+  constexpr double flops = 2.0 * K * M * M;
+  
+  std::cout << "\n";
+  std::cout << "========================================\n";
+  std::cout << "M=" << M << ", K=" << K << ", stride=" << stride 
+            << ", local_size=" << local_size << ", tile_size=" << max_tile_size << "\n";
+  std::cout << "Elements=" << (M*M) << ", Tiles=" << ((M*M)/(max_tile_size*max_tile_size))
+            << ", Threads/tile=" << (stride/((M*M)/(max_tile_size*max_tile_size))) << "\n";
+  std::cout << "========================================\n";
 
   auto* A = sycl::malloc_shared<Scalar>(K * M, q);
   auto* B = sycl::malloc_shared<Scalar>(K * M, q);
@@ -93,23 +88,21 @@ int main() {
   q.wait();
   auto C_correct = compute_naive(K, M, A, B);
 
-  std::cout << "=== Correctness Check (stride=" << stride << ") ===\n";
+  std::cout << "\n=== Correctness Check ===\n";
   auto check_correctness = [&](const char* name, auto&& kernel) {
     zero_C();
     kernel().wait();
-    std::cout << std::setw(12) << name << ": " << std::boolalpha
-              << is_correct(C_correct, C) << "\n";
+    bool correct = is_correct(C_correct, C, M);
+    std::cout << std::setw(12) << name << ": " << std::boolalpha << correct << "\n";
+    if (!correct) {
+      std::cout << "  (skipping performance test due to incorrect results)\n";
+    }
+    return correct;
   };
 
-  check_correctness("Variant 1", [&]() { return tsmttsm<Scalar, M, stride>(q, K, A, B, C); });
-  check_correctness("Variant 2", [&]() { return tsmttsm2<Scalar, M, stride, max_tile_size>(q, K, A, B, C); });
-  check_correctness("Variant 3", [&]() { return tsmttsm3<Scalar, M, stride, max_tile_size>(q, K, A, B, C); });
-  check_correctness("Variant 4", [&]() { return tsmttsm4<Scalar, M, stride, max_tile_size>(q, K, A, B, C); });
-  check_correctness("Variant 5", [&]() { return tsmttsm5<Scalar, M, stride, max_tile_size>(q, K, A, B, C); });
-  check_correctness("Variant 6", [&]() { return tsmttsm6<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); });
-  check_correctness("Variant 7", [&]() { return tsmttsm7<Scalar, M, stride, max_tile_size>(q, K, A, B, C); });
-  check_correctness("Variant 8", [&]() { return tsmttsm8<Scalar, M>(q, K, A, B, C); });
-  check_correctness("Variant 9", [&]() { return tsmttsm9<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); });
+  bool v4_correct = check_correctness("Variant 4", [&]() { return tsmttsm4<Scalar, M, stride, max_tile_size>(q, K, A, B, C); });
+  bool v6_correct = check_correctness("Variant 6", [&]() { return tsmttsm6<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); });
+  bool v9_correct = check_correctness("Variant 9", [&]() { return tsmttsm9<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); });
 
   std::cout << "\n=== Performance (warmup=" << warmup << ", runs=" << runs << ") ===\n";
 
@@ -148,24 +141,55 @@ int main() {
   auto print_stats = [](const char* name, const BenchmarkStats& s) {
     std::cout << std::setw(12) << name << ": "
               << std::fixed << std::setprecision(4)
-              << s.avg_ns / 1e6 << " ms (±" << s.stddev_ns / 1e6 << "), "
-              << "min=" << s.min_ns / 1e6 << ", max=" << s.max_ns / 1e6 << " ms, "
+              << s.avg_ns / 1e6 << " ms (±" << s.stddev_ns / 1e6 << " ms), "
               << std::setprecision(2) << s.gflops << " GFLOP/s\n";
   };
 
-  print_stats("Variant 1", run_and_profile([&]() { return tsmttsm<Scalar, M, stride>(q, K, A, B, C); }));
-  print_stats("Variant 2", run_and_profile([&]() { return tsmttsm2<Scalar, M, stride, max_tile_size>(q, K, A, B, C); }));
-  print_stats("Variant 3", run_and_profile([&]() { return tsmttsm3<Scalar, M, stride, max_tile_size>(q, K, A, B, C); }));
-  print_stats("Variant 4", run_and_profile([&]() { return tsmttsm4<Scalar, M, stride, max_tile_size>(q, K, A, B, C); }));
-  print_stats("Variant 5", run_and_profile([&]() { return tsmttsm5<Scalar, M, stride, max_tile_size>(q, K, A, B, C); }));
-  print_stats("Variant 6", run_and_profile([&]() { return tsmttsm6<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); }));
-  print_stats("Variant 7", run_and_profile([&]() { return tsmttsm7<Scalar, M, stride, max_tile_size>(q, K, A, B, C); }));
-  print_stats("Variant 8", run_and_profile([&]() { return tsmttsm8<Scalar, M>(q, K, A, B, C); }));
-  print_stats("Variant 9", run_and_profile([&]() { return tsmttsm9<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); }));
+  if (v4_correct) print_stats("Variant 4", run_and_profile([&]() { return tsmttsm4<Scalar, M, stride, max_tile_size>(q, K, A, B, C); }));
+  if (v6_correct) print_stats("Variant 6", run_and_profile([&]() { return tsmttsm6<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); }));
+  if (v9_correct) print_stats("Variant 9", run_and_profile([&]() { return tsmttsm9<Scalar, M, stride, local_size, max_tile_size>(q, K, A, B, C); }));
 
   sycl::free(A, q);
   sycl::free(B, q);
   sycl::free(C, q);
+}
+
+int main() {
+  sycl::queue q{{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}}};
+  std::cout << "Device: " << q.get_device().get_info<sycl::info::device::vendor>() << " "
+            << q.get_device().get_info<sycl::info::device::name>() << "\n";
+
+  using Scalar = float;
+  constexpr int K = 1024 * 1024;
+  constexpr int warmup = 50;
+  constexpr int runs = 100;
+
+  // Test different M values with various stride and tile size settings
+  // Format: M, stride, local_size, tile_size
+  
+  // M=4: 16 elements total
+  run_benchmark_suite<Scalar, 4, K, 4096, 32, 2, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 4, K, 4096, 32, 4, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 4, K, 8192, 32, 2, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 4, K, 8192, 32, 4, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 4, K, 16384, 32, 2, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 4, K, 16384, 32, 4, warmup, runs>(q);
+  
+  // M=8: 64 elements total
+  run_benchmark_suite<Scalar, 8, K, 4096, 32, 2, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 8, K, 4096, 32, 4, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 8, K, 8192, 32, 2, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 8, K, 8192, 32, 4, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 8, K, 16384, 32, 2, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 8, K, 16384, 32, 4, warmup, runs>(q);
+  
+  // M=16: 256 elements total
+  run_benchmark_suite<Scalar, 16, K, 8192, 32, 2, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 16, K, 8192, 32, 4, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 16, K, 16384, 32, 2, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 16, K, 16384, 32, 4, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 16, K, 32768, 32, 2, warmup, runs>(q);
+  run_benchmark_suite<Scalar, 16, K, 32768, 32, 4, warmup, runs>(q);
 
   return 0;
 }
