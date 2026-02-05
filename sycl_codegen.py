@@ -15,7 +15,7 @@ import argparse
 
 def generate_kernel(M, N, TM, TN, stride, local_size=32, 
                    transposed=True, leap_frog=False, 
-                   reduction="global", dtype="float"):
+                   reduction="global", unroll=1, dtype="float"):
     """
     Generate SYCL kernel code for TSMTTSM operation.
     
@@ -27,6 +27,7 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
         transposed: Use transposed tiling pattern for coalescing
         leap_frog: Use double buffering (prefetching)
         reduction: "global" (global atomics only) or "twolevel" (workgroup + global)
+        unroll: Loop unrolling factor for K iteration loop
         dtype: Data type (float, double)
     """
     
@@ -123,21 +124,23 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
     # Double buffering: declare buffer variables
     if leap_frog:
         code.append(f"      // Double buffering: declare now/next buffers")
-        for m in range(TM):
-            code.append(f"      T vANow_{m} = T(0);")
-        for n in range(TN):
-            code.append(f"      T vBNow_{n} = T(0);")
+        for u in range(unroll):
+            for m in range(TM):
+                code.append(f"      T vANow_{m}_{u} = T(0);")
+            for n in range(TN):
+                code.append(f"      T vBNow_{n}_{u} = T(0);")
         code.append(f"")
         
         # Prefetch first iteration
         code.append(f"      // Prefetch first iteration")
         code.append(f"      if (k_start < K) {{")
-        for m in range(TM):
-            expr = get_load_expr("A", M, TM, m, mthreads, "midx", "k_start")
-            code.append(f"        vANow_{m} = {expr};")
-        for n in range(TN):
-            expr = get_load_expr("B", N, TN, n, nthreads, "nidx", "k_start")
-            code.append(f"        vBNow_{n} = {expr};")
+        for u in range(unroll):
+            for m in range(TM):
+                expr = get_load_expr("A", M, TM, m, mthreads, "midx", f"k_start + {u}*k_stride")
+                code.append(f"        vANow_{m}_{u} = {expr};")
+            for n in range(TN):
+                expr = get_load_expr("B", N, TN, n, nthreads, "nidx", f"k_start + {u}*k_stride")
+                code.append(f"        vBNow_{n}_{u} = {expr};")
         code.append(f"      }}")
         code.append(f"")
     
@@ -145,50 +148,56 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
     code.append(f"      // Main computation loop")
     if leap_frog:
         code.append(f"      int k;")
-    loop_bound = "K - k_stride" if leap_frog else "K"
+    loop_bound = f"K - k_stride*{unroll}" if leap_frog else "K"
     k_decl = "k = k_start" if leap_frog else "int k = k_start"
-    code.append(f"      for ({k_decl}; k < {loop_bound}; k += k_stride) {{")
+    code.append(f"      for ({k_decl}; k < {loop_bound}; k += k_stride*{unroll}) {{")
     
-    if leap_frog:
-        # Prefetch next iteration (unconditionally - we know it's safe)
-        code.append(f"        // Prefetch next iteration")
-        for m in range(TM):
-            expr = get_load_expr("A", M, TM, m, mthreads, "midx", "k + k_stride")
-            code.append(f"        T vANext_{m} = {expr};")
-        for n in range(TN):
-            expr = get_load_expr("B", N, TN, n, nthreads, "nidx", "k + k_stride")
-            code.append(f"        T vBNext_{n} = {expr};")
-        code.append(f"")
-        
-        # Compute with current values
-        code.append(f"        // Compute with current buffers")
-        for m in range(TM):
+    # Process unroll iterations
+    for u in range(unroll):
+        if leap_frog:
+            # Prefetch next iteration (unconditionally - we know it's safe)
+            code.append(f"        // Prefetch next iteration (u={u})")
+            for m in range(TM):
+                expr = get_load_expr("A", M, TM, m, mthreads, "midx", f"k + k_stride*{unroll}")
+                code.append(f"        T vANext_{m}_{u} = {expr};")
             for n in range(TN):
-                code.append(f"        tS{m}_{n} += vANow_{m} * vBNow_{n};")
-        code.append(f"")
-        
-        # Swap buffers
-        code.append(f"        // Swap buffers")
-        for m in range(TM):
-            code.append(f"        vANow_{m} = vANext_{m};")
-        for n in range(TN):
-            code.append(f"        vBNow_{n} = vBNext_{n};")
-    else:
-        # Load current iteration
-        code.append(f"        // Load values")
-        for m in range(TM):
-            expr = get_load_expr("A", M, TM, m, mthreads, "midx", "k")
-            code.append(f"        T vA_{m} = {expr};")
-        for n in range(TN):
-            expr = get_load_expr("B", N, TN, n, nthreads, "nidx", "k")
-            code.append(f"        T vB_{n} = {expr};")
-        code.append(f"")
-        
-        # Compute
-        code.append(f"        // Compute outer product")
-        for m in range(TM):
+                expr = get_load_expr("B", N, TN, n, nthreads, "nidx", f"k + k_stride*{unroll}")
+                code.append(f"        T vBNext_{n}_{u} = {expr};")
+            code.append(f"")
+            
+            # Compute with current values
+            code.append(f"        // Compute with current buffers (u={u})")
+            for m in range(TM):
+                for n in range(TN):
+                    code.append(f"        tS{m}_{n} += vANow_{m}_{u} * vBNow_{n}_{u};")
+            code.append(f"")
+            
+            # Swap buffers
+            code.append(f"        // Swap buffers (u={u})")
+            for m in range(TM):
+                code.append(f"        vANow_{m}_{u} = vANext_{m}_{u};")
             for n in range(TN):
-                code.append(f"        tS{m}_{n} += vA_{m} * vB_{n};")
+                code.append(f"        vBNow_{n}_{u} = vBNext_{n}_{u};")
+            if u < unroll - 1:
+                code.append(f"")
+        else:
+            # Load current iteration
+            code.append(f"        // Load values (u={u})")
+            for m in range(TM):
+                expr = get_load_expr("A", M, TM, m, mthreads, "midx", f"k + {u}*k_stride")
+                code.append(f"        T vA_{m}_{u} = {expr};")
+            for n in range(TN):
+                expr = get_load_expr("B", N, TN, n, nthreads, "nidx", f"k + {u}*k_stride")
+                code.append(f"        T vB_{n}_{u} = {expr};")
+            code.append(f"")
+            
+            # Compute
+            code.append(f"        // Compute outer product (u={u})")
+            for m in range(TM):
+                for n in range(TN):
+                    code.append(f"        tS{m}_{n} += vA_{m}_{u} * vB_{n}_{u};")
+            if u < unroll - 1:
+                code.append(f"")
     
     code.append(f"      }}")
     code.append(f"")
@@ -197,9 +206,10 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
     if leap_frog:
         code.append(f"      // Process final iteration (data in vANow/vBNow)")
         code.append(f"      if (k < K) {{")
-        for m in range(TM):
-            for n in range(TN):
-                code.append(f"        tS{m}_{n} += vANow_{m} * vBNow_{n};")
+        for u in range(unroll):
+            for m in range(TM):
+                for n in range(TN):
+                    code.append(f"        tS{m}_{n} += vANow_{m}_{u} * vBNow_{n}_{u};")
         code.append(f"      }}")
         code.append(f"")
     
@@ -444,6 +454,8 @@ def main():
                        help='Number of threads (default: 16384)')
     parser.add_argument('--local-size', type=int, default=32,
                        help='Workgroup size (default: 32)')
+    parser.add_argument('--unroll', type=int, default=1,
+                       help='K-loop unrolling factor (default: 1)')
     parser.add_argument('--with-benchmark', action='store_true',
                        help='Generate benchmark code')
     args = parser.parse_args()
@@ -459,6 +471,7 @@ def main():
     print(" *   - Transposed tiling for coalesced memory access")
     print(" *   - Optional double buffering (leap-frog prefetching)")
     print(" *   - Optional two-level reduction (workgroup + global atomics)")
+    print(f" *   - K-loop unrolling factor: {args.unroll}")
     print(" */")
     print("")
     
@@ -475,19 +488,19 @@ def main():
                 
             # Variant 1: Basic with transposed tiling
             print(generate_kernel(M, M, TM, TM, args.stride, args.local_size,
-                                transposed=True, leap_frog=False, reduction="global"))
+                                transposed=True, leap_frog=False, reduction="global", unroll=args.unroll))
             
             # Variant 2: With double buffering
             print(generate_kernel(M, M, TM, TM, args.stride, args.local_size,
-                                transposed=True, leap_frog=True, reduction="global"))
+                                transposed=True, leap_frog=True, reduction="global", unroll=args.unroll))
             
             # Variant 3: Two-level reduction
             print(generate_kernel(M, M, TM, TM, args.stride, args.local_size,
-                                transposed=True, leap_frog=False, reduction="twolevel"))
+                                transposed=True, leap_frog=False, reduction="twolevel", unroll=args.unroll))
             
             # Variant 4: All optimizations
             print(generate_kernel(M, M, TM, TM, args.stride, args.local_size,
-                                transposed=True, leap_frog=True, reduction="twolevel"))
+                                transposed=True, leap_frog=True, reduction="twolevel", unroll=args.unroll))
     
     if args.with_benchmark:
         print(generate_benchmark_code(args.M, args.tile_sizes, args.stride, args.local_size))
