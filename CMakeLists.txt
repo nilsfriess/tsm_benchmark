@@ -10,3 +10,7 @@ find_package(AdaptiveCpp REQUIRED)
 add_executable(main main.cc)
 target_precompile_headers(main PRIVATE <sycl/sycl.hpp>)
 add_sycl_to_target(TARGET main)
+
+add_executable(main_codegen main_codegen.cc)
+target_precompile_headers(main_codegen PRIVATE <sycl/sycl.hpp>)
+add_sycl_to_target(TARGET main_codegen)
