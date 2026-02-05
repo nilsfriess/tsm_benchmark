@@ -292,7 +292,7 @@ def generate_benchmark_code(M_list, tile_sizes, stride, local_size):
     code.append("}")
     code.append("")
     code.append("template <typename T>")
-    code.append("bool check_correctness(const std::vector<T>& C_ref, T* C, int M, T abs_tol = 1e-3, T rel_tol = 1e-3) {")
+    code.append("bool check_correctness(const std::vector<T>& C_ref, T* C, int M, T abs_tol = 1e-4, T rel_tol = 1e-8) {")
     code.append("  for (int i = 0; i < M * M; ++i) {")
     code.append("    T diff = std::abs(C_ref[i] - C[i]);")
     code.append("    T mag = std::max(std::abs(C_ref[i]), std::abs(C[i]));")
