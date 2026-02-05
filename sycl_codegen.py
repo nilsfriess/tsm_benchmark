@@ -158,10 +158,10 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
             # Prefetch next iteration (unconditionally - we know it's safe)
             code.append(f"        // Prefetch next iteration (u={u})")
             for m in range(TM):
-                expr = get_load_expr("A", M, TM, m, mthreads, "midx", f"k + k_stride*{unroll}")
+                expr = get_load_expr("A", M, TM, m, mthreads, "midx", f"k + k_stride*({unroll} + {u})")
                 code.append(f"        T vANext_{m}_{u} = {expr};")
             for n in range(TN):
-                expr = get_load_expr("B", N, TN, n, nthreads, "nidx", f"k + k_stride*{unroll}")
+                expr = get_load_expr("B", N, TN, n, nthreads, "nidx", f"k + k_stride*({unroll} + {u})")
                 code.append(f"        T vBNext_{n}_{u} = {expr};")
             code.append(f"")
             
