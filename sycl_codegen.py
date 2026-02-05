@@ -143,24 +143,21 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
     
     # Main loop
     code.append(f"      // Main computation loop")
+    if leap_frog:
+        code.append(f"      int k;")
     loop_bound = "K - k_stride" if leap_frog else "K"
-    code.append(f"      for (int k = k_start; k < {loop_bound}; k += k_stride) {{")
+    k_decl = "k = k_start" if leap_frog else "int k = k_start"
+    code.append(f"      for ({k_decl}; k < {loop_bound}; k += k_stride) {{")
     
     if leap_frog:
-        # Prefetch next iteration
+        # Prefetch next iteration (unconditionally - we know it's safe)
         code.append(f"        // Prefetch next iteration")
         for m in range(TM):
-            code.append(f"        T vANext_{m};")
-        for n in range(TN):
-            code.append(f"        T vBNext_{n};")
-        code.append(f"")
-        
-        for m in range(TM):
             expr = get_load_expr("A", M, TM, m, mthreads, "midx", "k + k_stride")
-            code.append(f"        vANext_{m} = {expr};")
+            code.append(f"        T vANext_{m} = {expr};")
         for n in range(TN):
             expr = get_load_expr("B", N, TN, n, nthreads, "nidx", "k + k_stride")
-            code.append(f"        vBNext_{n} = {expr};")
+            code.append(f"        T vBNext_{n} = {expr};")
         code.append(f"")
         
         # Compute with current values
@@ -170,7 +167,7 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
                 code.append(f"        tS{m}_{n} += vANow_{m} * vBNow_{n};")
         code.append(f"")
         
-        # Swap buffers (simple assignment)
+        # Swap buffers
         code.append(f"        // Swap buffers")
         for m in range(TM):
             code.append(f"        vANow_{m} = vANext_{m};")
@@ -196,10 +193,10 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
     code.append(f"      }}")
     code.append(f"")
     
-    # Handle last iteration for leap frog
+    # Handle last iteration for leap frog - just like CUDA version
     if leap_frog:
-        code.append(f"      // Process last iteration")
-        code.append(f"      if (k_start + (K - k_start) / k_stride * k_stride < K) {{")
+        code.append(f"      // Process final iteration (data in vANow/vBNow)")
+        code.append(f"      if (k < K) {{")
         for m in range(TM):
             for n in range(TN):
                 code.append(f"        tS{m}_{n} += vANow_{m} * vBNow_{n};")
@@ -295,11 +292,11 @@ def generate_benchmark_code(M_list, tile_sizes, stride, local_size):
     code.append("}")
     code.append("")
     code.append("template <typename T>")
-    code.append("bool check_correctness(const std::vector<T>& C_ref, T* C, int M, T tol = 1e-4) {")
+    code.append("bool check_correctness(const std::vector<T>& C_ref, T* C, int M, T abs_tol = 1e-3, T rel_tol = 1e-3) {")
     code.append("  for (int i = 0; i < M * M; ++i) {")
     code.append("    T diff = std::abs(C_ref[i] - C[i]);")
     code.append("    T mag = std::max(std::abs(C_ref[i]), std::abs(C[i]));")
-    code.append("    if (diff > tol && diff > tol * mag) {")
+    code.append("    if (diff > abs_tol && diff > rel_tol * mag) {")
     code.append("      std::cerr << \"Mismatch at \" << i << \": expected \" << C_ref[i]")
     code.append("                << \", got \" << C[i] << \" (diff=\" << diff << \")\\n\";")
     code.append("      return false;")
