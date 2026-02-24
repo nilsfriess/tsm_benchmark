@@ -13,9 +13,9 @@ import sys
 import argparse
 
 
-def generate_kernel(M, N, TM, TN, stride, local_size=32, 
-                   transposed=True, leap_frog=False, 
-                   reduction="global", unroll=1, dtype="float"):
+def generate_kernel(M, N, TM, TN, stride, local_size=32,
+                   transposed=True, leap_frog=False,
+                   reduction="global", unroll=1):
     """
     Generate SYCL kernel code for TSMTTSM operation.
     
@@ -28,7 +28,6 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
         leap_frog: Use double buffering (prefetching)
         reduction: "global" (global atomics only) or "twolevel" (workgroup + global)
         unroll: Loop unrolling factor for K iteration loop
-        dtype: Data type (float, double)
     """
     
     mthreads = (M + TM - 1) // TM
@@ -94,11 +93,8 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
     if reduction == "twolevel":
         code.append(f"      constexpr int TM = {TM};")
         code.append(f"      constexpr int TN = {TN};")
-        code.append(f"      if (lid == 0) {{")
-        code.append(f"        for (int m = 0; m < TM; ++m)")
-        code.append(f"          for (int n = 0; n < TN; ++n)")
-        code.append(f"            C_shared[m][n] = T(0);")
-        code.append(f"      }}")
+        code.append(f"      for (int i = lid; i < TM * TN; i += local_size)")
+        code.append(f"        C_shared[i / TN][i % TN] = T(0);")
         code.append(f"      item.barrier(sycl::access::fence_space::local_space);")
         code.append(f"")
     
@@ -131,17 +127,18 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
                 code.append(f"      T vBNow_{n}_{u} = T(0);")
         code.append(f"")
         
-        # Prefetch first iteration
+        # Prefetch first iteration (per-u bounds guard to avoid OOB when unroll > 1)
         code.append(f"      // Prefetch first iteration")
-        code.append(f"      if (k_start < K) {{")
         for u in range(unroll):
+            cond = "k_start < K" if u == 0 else f"k_start + {u}*k_stride < K"
+            code.append(f"      if ({cond}) {{")
             for m in range(TM):
                 expr = get_load_expr("A", M, TM, m, mthreads, "midx", f"k_start + {u}*k_stride")
                 code.append(f"        vANow_{m}_{u} = {expr};")
             for n in range(TN):
                 expr = get_load_expr("B", N, TN, n, nthreads, "nidx", f"k_start + {u}*k_stride")
                 code.append(f"        vBNow_{n}_{u} = {expr};")
-        code.append(f"      }}")
+            code.append(f"      }}")
         code.append(f"")
     
     # Main loop
@@ -155,14 +152,14 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
     # Process unroll iterations
     for u in range(unroll):
         if leap_frog:
-            # Prefetch next iteration (unconditionally - we know it's safe)
+            # Prefetch next iteration with bounds guard (OOB for u > 0 when unroll > 1)
             code.append(f"        // Prefetch next iteration (u={u})")
             for m in range(TM):
                 expr = get_load_expr("A", M, TM, m, mthreads, "midx", f"k + k_stride*({unroll} + {u})")
-                code.append(f"        T vANext_{m}_{u} = {expr};")
+                code.append(f"        T vANext_{m}_{u} = (k + k_stride*({unroll} + {u}) < K) ? {expr} : T(0);")
             for n in range(TN):
                 expr = get_load_expr("B", N, TN, n, nthreads, "nidx", f"k + k_stride*({unroll} + {u})")
-                code.append(f"        T vBNext_{n}_{u} = {expr};")
+                code.append(f"        T vBNext_{n}_{u} = (k + k_stride*({unroll} + {u}) < K) ? {expr} : T(0);")
             code.append(f"")
             
             # Compute with current values
@@ -202,15 +199,18 @@ def generate_kernel(M, N, TM, TN, stride, local_size=32,
     code.append(f"      }}")
     code.append(f"")
     
-    # Handle last iteration for leap frog - just like CUDA version
+    # Handle remaining iterations after the main leap-frog loop.
+    # After the loop, vANow_{m}_{u} holds data for k_final + u*k_stride,
+    # so each u needs its own in-bounds guard.
     if leap_frog:
-        code.append(f"      // Process final iteration (data in vANow/vBNow)")
-        code.append(f"      if (k < K) {{")
+        code.append(f"      // Process remaining iterations (data in vANow/vBNow)")
         for u in range(unroll):
+            cond = "k < K" if u == 0 else f"k + {u}*k_stride < K"
+            code.append(f"      if ({cond}) {{")
             for m in range(TM):
                 for n in range(TN):
                     code.append(f"        tS{m}_{n} += vANow_{m}_{u} * vBNow_{n}_{u};")
-        code.append(f"      }}")
+            code.append(f"      }}")
         code.append(f"")
     
     # Reduction
@@ -472,7 +472,26 @@ def main():
     parser.add_argument('--with-benchmark', action='store_true',
                        help='Generate benchmark code')
     args = parser.parse_args()
-    
+
+    # Validate that stride is divisible by local_size (required for nd_range)
+    if args.stride % args.local_size != 0:
+        print(f"Error: --stride ({args.stride}) must be a multiple of --local-size ({args.local_size})", file=sys.stderr)
+        sys.exit(1)
+
+    # Warn if stride is not a multiple of num_tiles*local_size for any tile combination,
+    # since that would cause uneven k_stride distribution across groups.
+    for M in args.M:
+        for TM in args.tile_sizes:
+            if M % TM != 0:
+                continue
+            mthreads = (M + TM - 1) // TM
+            num_tiles = mthreads * mthreads
+            required = num_tiles * args.local_size
+            if args.stride % required != 0:
+                print(f"Warning: --stride ({args.stride}) is not a multiple of "
+                      f"num_tiles*local_size={required} for M={M}, TM={TM}. "
+                      f"Consider using a multiple of {required}.", file=sys.stderr)
+
     print("#pragma once")
     print("")
     print("#include <sycl/sycl.hpp>")
